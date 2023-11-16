@@ -34,6 +34,15 @@ if TYPE_CHECKING:
     from .model import Whisper
 
 
+def compare_spectrogram(audio):
+    base = log_mel_spectrogram(audio)
+    test = torch.zeros((80, 0))
+    for i in  log_mel_spectrogram(audio, chunked=True):
+        if len(i) == 2:
+            i = i[0]
+        test = torch.concat([test, i], dim=-1)
+    return base.size() == test.size() and base.isclose(test).all().item()
+
 def transcribe(
     model: "Whisper",
     audio: Union[str, np.ndarray, torch.Tensor],
@@ -118,9 +127,10 @@ def transcribe(
     if dtype == torch.float32:
         decode_options["fp16"] = False
 
+    print(compare_spectrogram(audio))
     # Pad 30-seconds of silence to the input audio, for slicing
-    mel = log_mel_spectrogram(audio, model.dims.n_mels, padding=N_SAMPLES)
-    content_frames = mel.shape[-1] - N_FRAMES
+    mel_gen = log_mel_spectrogram(audio, model.dims.n_mels, chunked=True, padding=N_SAMPLES)
+    mel, content_frames = next(mel_gen)
 
     if decode_options.get("language", None) is None:
         if not model.is_multilingual:
@@ -229,9 +239,12 @@ def transcribe(
         total=content_frames, unit="frames", disable=verbose is not False
     ) as pbar:
         last_speech_timestamp = 0.0
-        while seek < content_frames:
+        while mel.shape[-1]:
+            if mel.shape[-1] < 4 * N_FRAMES and (nmel := next(mel_gen, None)) is not None:
+                mel = torch.concat([mel, nmel], dim=-1)
+
             time_offset = float(seek * HOP_LENGTH / SAMPLE_RATE)
-            mel_segment = mel[:, seek : seek + N_FRAMES]
+            mel_segment = mel[:, : N_FRAMES]
             segment_size = min(N_FRAMES, content_frames - seek)
             segment_duration = segment_size * HOP_LENGTH / SAMPLE_RATE
             mel_segment = pad_or_trim(mel_segment, N_FRAMES).to(model.device).to(dtype)
@@ -240,6 +253,7 @@ def transcribe(
             result: DecodingResult = decode_with_fallback(mel_segment)
             tokens = torch.tensor(result.tokens)
 
+            seek_shift = 0
             if no_speech_threshold is not None:
                 # no voice activity check
                 should_skip = result.no_speech_prob > no_speech_threshold
@@ -251,10 +265,12 @@ def transcribe(
                     should_skip = False
 
                 if should_skip:
-                    seek += segment_size  # fast-forward to the next segment boundary
+                    seek_shift += segment_size  # fast-forward to the next segment boundary
+                    pbar.update(seek_shift)
+                    seek += seek_shift
+                    mel = mel[:, seek_shift:]
                     continue
 
-            previous_seek = seek
             current_segments = []
 
             timestamp_tokens: torch.Tensor = tokens.ge(tokenizer.timestamp_begin)
@@ -289,13 +305,13 @@ def transcribe(
 
                 if single_timestamp_ending:
                     # single timestamp at the end means no speech after the last timestamp.
-                    seek += segment_size
+                    seek_shift += segment_size
                 else:
                     # otherwise, ignore the unfinished segment and seek to the last timestamp
                     last_timestamp_pos = (
                         tokens[last_slice - 1].item() - tokenizer.timestamp_begin
                     )
-                    seek += last_timestamp_pos * input_stride
+                    seek_shift += last_timestamp_pos * input_stride
             else:
                 duration = segment_duration
                 timestamps = tokens[timestamp_tokens.nonzero().flatten()]
@@ -317,7 +333,7 @@ def transcribe(
                         result=result,
                     )
                 )
-                seek += segment_size
+                seek_shift += segment_size
 
             if word_timestamps:
                 add_word_timestamps(
@@ -339,8 +355,6 @@ def transcribe(
                     seek_shift = round(
                         (word_end_timestamps[-1] - time_offset) * FRAMES_PER_SECOND
                     )
-                    if seek_shift > 0:
-                        seek = previous_seek + seek_shift
 
             if verbose:
                 for segment in current_segments:
@@ -371,8 +385,12 @@ def transcribe(
                 # do not feed the prompt tokens if a high temperature was used
                 prompt_reset_since = len(all_tokens)
 
+
             # update progress bar
-            pbar.update(min(content_frames, seek) - previous_seek)
+            seek_shift = min(mel.shape[-1], seek_shift)
+            pbar.update(seek_shift)
+            seek += seek_shift
+            mel = mel[:, seek_shift:]
 
     return dict(
         text=tokenizer.decode(all_tokens[len(initial_prompt_tokens) :]),
@@ -381,6 +399,7 @@ def transcribe(
     )
 
 
+@torch.no_grad()
 def cli():
     from . import available_models
 

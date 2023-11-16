@@ -106,12 +106,13 @@ def mel_filters(device, n_mels: int) -> torch.Tensor:
     with np.load(filters_path, allow_pickle=False) as f:
         return torch.from_numpy(f[f"mel_{n_mels}"]).to(device)
 
-
 def log_mel_spectrogram(
     audio: Union[str, np.ndarray, torch.Tensor],
     n_mels: int = 80,
     padding: int = 0,
     device: Optional[Union[str, torch.device]] = None,
+    chunked: bool = False,
+    chunk_size: int = 10*N_SAMPLES, # 5 minute chunks
 ):
     """
     Compute the log-Mel spectrogram of
@@ -130,10 +131,19 @@ def log_mel_spectrogram(
     device: Optional[Union[str, torch.device]]
         If given, the audio tensor is moved to this device before STFT
 
+    chunked: bool
+        If True, returns a generator that when invoked returns the spectrogram of the next audio chunk of size chunk_size
+
+    chunk_size: int
+        The size of each audio chunk in samples
+
     Returns
     -------
     torch.Tensor, shape = (80, n_frames)
         A Tensor that contains the Mel spectrogram
+
+    Iterator[torch.Tensor], shape = (80, n_frames)
+        A generator that returns the mel spectrogram of the next audio chunk
     """
     if not torch.is_tensor(audio):
         if isinstance(audio, str):
@@ -144,14 +154,48 @@ def log_mel_spectrogram(
         audio = audio.to(device)
     if padding > 0:
         audio = F.pad(audio, (0, padding))
-    window = torch.hann_window(N_FFT).to(audio.device)
-    stft = torch.stft(audio, N_FFT, HOP_LENGTH, window=window, return_complex=True)
-    magnitudes = stft[..., :-1].abs() ** 2
 
-    filters = mel_filters(audio.device, n_mels)
-    mel_spec = filters @ magnitudes
+    # https://pytorch.org/docs/stable/_modules/torch/functional.html#stft
+    def pad(audio: torch.Tensor):
+        signal_dim = audio.dim()
+        extended_shape = [1] * (3 - signal_dim) + list(audio.size())
+        pad = int(N_FFT // 2)
+        audio = F.pad(audio.view(extended_shape), [pad, pad], 'reflect')
+        return audio.view(audio.shape[-signal_dim:])
 
-    log_spec = torch.clamp(mel_spec, min=1e-10).log10()
-    log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
-    log_spec = (log_spec + 4.0) / 4.0
-    return log_spec
+    audio = pad(audio) # center=False
+
+    mmel = float('-inf') # TODO: Remove this somehow
+    def _log_mel_spectrogram(audio: torch.Tensor):
+        nonlocal mmel
+        window = torch.hann_window(N_FFT).to(audio.device)
+        stft = torch.stft(audio, N_FFT, HOP_LENGTH, window=window, return_complex=True, center=False)
+        magnitudes = stft[..., :-1].abs() ** 2
+
+        filters = mel_filters(audio.device, n_mels)
+        mel_spec = filters @ magnitudes
+
+        log_spec = torch.clamp(mel_spec, min=1e-10).log10()
+
+        nmax = log_spec.max()
+        if nmax > mmel: mmel = nmax
+
+        log_spec = torch.maximum(log_spec, mmel - 8.0)
+        log_spec = (log_spec + 4.0) / 4.0
+        return log_spec
+
+    def generator():
+        i = HOP_LENGTH
+        while i < len(audio)-2*HOP_LENGTH:
+            chunk = audio[i-HOP_LENGTH:i+chunk_size+HOP_LENGTH]
+            log_spec = _log_mel_spectrogram(chunk)
+            if i == HOP_LENGTH:
+                yield log_spec, audio.shape[-1] / HOP_LENGTH
+            else:
+                yield log_spec
+            i += log_spec.shape[-1] * HOP_LENGTH
+
+    if chunked:
+        return generator()
+    else:
+        return _log_mel_spectrogram(audio)
